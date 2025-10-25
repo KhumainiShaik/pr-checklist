@@ -1,0 +1,5 @@
+# version: 0.1.0
+apiVersion: v2
+name: sample-chart
+description: A Helm chart for testing PR checklist workflow
+version: 0.1.0

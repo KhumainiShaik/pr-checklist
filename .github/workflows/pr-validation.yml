@@ -1,75 +1,228 @@
-name: PR Checklist Verification
+name: PR Author Checklist and Validation
 
 on:
   pull_request:
     types: [opened, edited, synchronize]
+  workflow_dispatch:
 
 jobs:
-  validate-pr:
-    name: Validate PR Checks
+  author-checklist:
     runs-on: ubuntu-latest
-
+    name: Verify Author Checklist
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Ensure all checklist items are checked in PR description
-        id: checklist
-        uses: actions/github-script@v7
+      - name: Add PR checklist comment
+        uses: mheap/github-action-checklist@v2
         with:
-          script: |
-            const body = context.payload.pull_request.body || "";
-            const unchecked = body.match(/- \[ \]/g);
+          token: ${{ secrets.GITHUB_TOKEN }}
+          comment: |
+            ## 🧾 Author Checklist
+            
+            Please confirm that you have completed each of the following before requesting review.  
+            All items **must be checked** to proceed.
 
-            if (unchecked) {
-              core.setFailed("❌ Please check all checklist items before submitting the PR.");
-            } else {
-              console.log("✅ All checklist items are checked.");
-            }
+            ### 🧩 Chart.yaml Files
+            - [ ] Chart version number matches the version comment
+            - [ ] All modified charts have updated version numbers
 
-      - name: Verify Chart.yaml version
+            ### 🧱 Template Files (DRY Principle)
+            - [ ] No duplicate code blocks introduced
+            - [ ] No duplicate ranges or conditionals introduced
+            - [ ] Template logic follows DRY principle
+
+            ### 🧪 Test Files
+            - [ ] Unit test descriptions follow:  
+              _"should <verb> <resource/role> [to <target>] when <condition>"_
+            - [ ] All new functionality has corresponding unit tests
+
+            ### 🧹 Code Quality
+            - [ ] Code reviewed for best practices
+            - [ ] No hardcoded values that should be configurable
+            - [ ] Documentation updated if necessary
+
+            ### 🧭 Validation
+            - [ ] Schema validation passes for all changed charts
+            - [ ] Helm lint passes for modified charts
+            - [ ] No breaking changes introduced without versioning
+
+            ---
+            **Instructions:**
+            1. Check each box (`[x]`) once completed  
+            2. Workflow fails until all are checked  
+            3. Once all pass, PR will be ready for review
+
+  chart-validation:
+    runs-on: ubuntu-latest
+    name: Chart Structure Validation
+    needs: author-checklist
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v34
+        with:
+          files: |
+            helm-charts/**
+
+      - name: Validate Chart.yaml versions
+        if: steps.changed-files.outputs.any_changed == 'true'
+        shell: bash
         run: |
-          chart_version=$(grep '^version:' Chart.yaml | awk '{print $2}')
-          comment_version=$(grep '# *version:' Chart.yaml | awk '{print $3}')
+          validation_failed=false
+          echo "Validating Chart.yaml version consistency..."
 
-          if [ -z "$chart_version" ] || [ -z "$comment_version" ]; then
-            echo "❌ Missing version or version comment in Chart.yaml"
-            exit 1
-          fi
-          if [ "$chart_version" != "$comment_version" ]; then
-            echo "❌ Chart.yaml version ($chart_version) does not match version comment ($comment_version)"
-            exit 1
-          fi
-          echo "✅ Chart.yaml version matches."
+          IFS=$'\n'
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            if [[ $file == *"Chart.yaml" ]]; then
+              echo "Checking $file"
+              
+              chart_version=$(grep "^version:" "$file" | awk '{print $2}' | tr -d '"' | tr -d "'")
+              comment_version=$(grep -E "^\s*#.*version:\s*" "$file" | awk '{print $NF}' | tr -d '"' | tr -d "'")
+              
+              if [[ -n "$chart_version" && -n "$comment_version" ]]; then
+                if [[ "$chart_version" != "$comment_version" ]]; then
+                  echo "ERROR: Version mismatch in $file:"
+                  echo "   Chart: $chart_version | Comment: $comment_version"
+                  validation_failed=true
+                else
+                  echo "✅ Version OK: $chart_version"
+                fi
+              else
+                echo "⚠️ Missing version fields in $file"
+              fi
+            fi
+          done
 
-      - name: Check for duplicate template code
+          if [[ "$validation_failed" == "true" ]]; then
+            echo "❌ Chart version validation failed"
+            exit 1
+          else
+            echo "✅ All Chart.yaml versions are consistent"
+          fi
+
+      - name: Check for duplicate template patterns
+        if: steps.changed-files.outputs.any_changed == 'true'
+        shell: bash
         run: |
-          duplicate_count=$(grep -R -h -o '{{[^}]*}}' templates/ | sort | uniq -d | wc -l)
-          if [ "$duplicate_count" -gt 0 ]; then
-            echo "❌ Duplicate Helm template code found."
-            grep -R -h -o '{{[^}]*}}' templates/ | sort | uniq -d
+          validation_failed=false
+          echo "Checking for duplicate patterns in templates..."
+
+          IFS=$'\n'
+          template_files=$(echo "${{ steps.changed-files.outputs.all_changed_files }}" | grep -E "templates/.*\.(yaml|yml)$" || true)
+
+          if [[ -n "$template_files" ]]; then
+            temp_file=$(mktemp)
+            for file in $template_files; do
+              if [[ -f "$file" ]]; then
+                grep -n "{{.*if.*}}" "$file" | sed "s|^|$file:|" >> "$temp_file.conditions" || true
+                grep -n "{{.*range.*}}" "$file" | sed "s|^|$file:|" >> "$temp_file.ranges" || true
+              fi
+            done
+
+            if [[ -f "$temp_file.conditions" ]]; then
+              duplicates=$(awk -F: '{print $3}' "$temp_file.conditions" | sort | uniq -d)
+              if [[ -n "$duplicates" ]]; then
+                echo "❌ Duplicate conditional patterns found:"
+                echo "$duplicates"
+                validation_failed=true
+              fi
+            fi
+
+            if [[ -f "$temp_file.ranges" ]]; then
+              duplicates=$(awk -F: '{print $3}' "$temp_file.ranges" | sort | uniq -d)
+              if [[ -n "$duplicates" ]]; then
+                echo "❌ Duplicate range patterns found:"
+                echo "$duplicates"
+                validation_failed=true
+              fi
+            fi
+
+            rm -f "$temp_file"*
+            [[ "$validation_failed" == "false" ]] && echo "✅ No duplicate patterns found"
+          else
+            echo "ℹ️ No template files changed"
+          fi
+
+          if [[ "$validation_failed" == "true" ]]; then
+            echo "❌ Template validation failed"
             exit 1
           fi
-          echo "✅ No duplicate Helm code found."
 
-      - name: Check duplicate ranges/conditionals
+  test-validation:
+    runs-on: ubuntu-latest
+    name: Test Format Validation
+    needs: author-checklist
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get changed test files
+        id: test-files
+        uses: tj-actions/changed-files@v34
+        with:
+          files: |
+            helm-charts/**/tests/**
+
+      - name: Validate test description format
+        if: steps.test-files.outputs.any_changed == 'true'
+        shell: bash
         run: |
-          cond_count=$(grep -R -E '{{-? *(range|if|else if) ' templates/ | sort | uniq -d | wc -l)
-          if [ "$cond_count" -gt 0 ]; then
-            echo "❌ Duplicate conditionals or ranges found."
-            grep -R -E '{{-? *(range|if|else if) ' templates/ | sort | uniq -d
-            exit 1
-          fi
-          echo "✅ No duplicate conditionals or ranges found."
+          validation_failed=false
+          echo "Validating test description formats..."
 
-      - name: Verify unit test description format
+          IFS=$'\n'
+          for file in ${{ steps.test-files.outputs.all_changed_files }}; do
+            [[ "$file" != *.yaml && "$file" != *.yml ]] && continue
+            echo "Checking $file"
+
+            descriptions=$(grep -E "^\s*it:\s*" "$file" | sed 's/.*it:\s*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' || true)
+
+            if [[ -n "$descriptions" ]]; then
+              while IFS= read -r desc; do
+                [[ -z "$desc" ]] && continue
+                if [[ "$desc" =~ ^should\ [a-zA-Z]+\ .+\ when\ .+ ]]; then
+                  echo "✅ Valid: '$desc'"
+                else
+                  echo "❌ Invalid: '$desc'"
+                  validation_failed=true
+                fi
+              done <<< "$descriptions"
+            else
+              echo "ℹ️ No test descriptions found in $file"
+            fi
+          done
+
+          if [[ "$validation_failed" == "true" ]]; then
+            echo "❌ Test format validation failed"
+            exit 1
+          else
+            echo "✅ All test descriptions follow correct format"
+          fi
+
+  validation-summary:
+    runs-on: ubuntu-latest
+    name: Validation Summary
+    needs: [author-checklist, chart-validation, test-validation]
+    if: always()
+    steps:
+      - name: Summary of Results
+        shell: bash
         run: |
-          invalid_tests=$(grep -R -E 'it\(|describe\(' tests/ | grep -vE 'should [a-z]+ [a-zA-Z0-9_/.-]+( to [a-zA-Z0-9_/.-]+)? when [a-zA-Z0-9_ ]+' || true)
+          echo "## ✅ Validation Summary"
+          echo ""
+          echo "| Check | Status |"
+          echo "|-------|--------|"
+          echo "| Author Checklist | ${{ needs.author-checklist.result }} |"
+          echo "| Chart Validation | ${{ needs.chart-validation.result }} |"
+          echo "| Test Validation | ${{ needs.test-validation.result }} |"
+          echo ""
 
-          if [ -n "$invalid_tests" ]; then
-            echo "❌ Found invalid test descriptions:"
-            echo "$invalid_tests"
+          if [[ "${{ needs.author-checklist.result }}" == "success" && \
+                "${{ needs.chart-validation.result }}" == "success" && \
+                "${{ needs.test-validation.result }}" == "success" ]]; then
+            echo "🎉 All validations passed! Ready for review."
+          else
+            echo "⚠️ Some validations failed. Please check logs."
             exit 1
           fi
-
-          echo "✅ All unit test descriptions follow the correct format."
