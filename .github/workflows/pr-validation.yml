@@ -1,0 +1,75 @@
+name: PR Checklist Verification
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  validate-pr:
+    name: Validate PR Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure all checklist items are checked in PR description
+        id: checklist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || "";
+            const unchecked = body.match(/- \[ \]/g);
+
+            if (unchecked) {
+              core.setFailed("❌ Please check all checklist items before submitting the PR.");
+            } else {
+              console.log("✅ All checklist items are checked.");
+            }
+
+      - name: Verify Chart.yaml version
+        run: |
+          chart_version=$(grep '^version:' Chart.yaml | awk '{print $2}')
+          comment_version=$(grep '# *version:' Chart.yaml | awk '{print $3}')
+
+          if [ -z "$chart_version" ] || [ -z "$comment_version" ]; then
+            echo "❌ Missing version or version comment in Chart.yaml"
+            exit 1
+          fi
+          if [ "$chart_version" != "$comment_version" ]; then
+            echo "❌ Chart.yaml version ($chart_version) does not match version comment ($comment_version)"
+            exit 1
+          fi
+          echo "✅ Chart.yaml version matches."
+
+      - name: Check for duplicate template code
+        run: |
+          duplicate_count=$(grep -R -h -o '{{[^}]*}}' templates/ | sort | uniq -d | wc -l)
+          if [ "$duplicate_count" -gt 0 ]; then
+            echo "❌ Duplicate Helm template code found."
+            grep -R -h -o '{{[^}]*}}' templates/ | sort | uniq -d
+            exit 1
+          fi
+          echo "✅ No duplicate Helm code found."
+
+      - name: Check duplicate ranges/conditionals
+        run: |
+          cond_count=$(grep -R -E '{{-? *(range|if|else if) ' templates/ | sort | uniq -d | wc -l)
+          if [ "$cond_count" -gt 0 ]; then
+            echo "❌ Duplicate conditionals or ranges found."
+            grep -R -E '{{-? *(range|if|else if) ' templates/ | sort | uniq -d
+            exit 1
+          fi
+          echo "✅ No duplicate conditionals or ranges found."
+
+      - name: Verify unit test description format
+        run: |
+          invalid_tests=$(grep -R -E 'it\(|describe\(' tests/ | grep -vE 'should [a-z]+ [a-zA-Z0-9_/.-]+( to [a-zA-Z0-9_/.-]+)? when [a-zA-Z0-9_ ]+' || true)
+
+          if [ -n "$invalid_tests" ]; then
+            echo "❌ Found invalid test descriptions:"
+            echo "$invalid_tests"
+            exit 1
+          fi
+
+          echo "✅ All unit test descriptions follow the correct format."
